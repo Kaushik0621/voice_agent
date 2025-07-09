@@ -1,222 +1,323 @@
-# """
-# LiveKit outbound-call smoke-test
-# ────────────────────────────────
-# • Places an outbound SIP call via LiveKit Cloud
-# • Greets the callee, asks a yes/no question
-# • Branches on reply, says goodbye, hangs up
-# """
 
-# import os, logging, asyncio
+# import os
+# import json
+# import sys
+# import asyncio
+# import random
+# import time
 # from dotenv import load_dotenv
-# from livekit.agents import (
-#     Agent, AgentSession, JobContext, RoomInputOptions,
-#     cli, WorkerOptions,
+
+# from livekit.agents.cli import run_app
+# from livekit.agents import JobContext, WorkerOptions, AutoSubscribe
+# from livekit.agents.voice import AgentSession, Agent
+# from livekit.api.sip_service import CreateSIPParticipantRequest
+# from livekit.plugins.azure.stt import STT as AzureSTT
+# from livekit.plugins.azure.tts import TTS as AzureTTS
+# from livekit.plugins.openai import LLM as OpenAILLM
+# from livekit.plugins.silero.vad import VAD as SileroVAD
+
+# # Load environment variables
+# dotenv_path = os.getenv("DOTENV_PATH")
+# load_dotenv(dotenv_path if dotenv_path else None)
+
+# # Enhanced instructions for natural speech
+# NATURAL_SPEECH_INSTRUCTIONS = """
+# You are a friendly, helpful assistant named Heka. Speak naturally with occasional conversational fillers like 
+# "um", "uh", "you know", "like", "actually", and "I mean" to sound more human. Use short pauses between thoughts 
+# represented by commas and periods. Keep responses concise but add natural variations in pacing.
+
+# Examples of natural responses:
+# - "Hmm, let me think about that for a moment..."
+# - "Okay, so what you're asking is... uh... about the weather?"
+# - "Well, actually, I believe the forecast says..."
+# - "You know, I think we should consider..."
+# - "Right, so to answer your question..."
+
+# Focus on creating natural, flowing conversation rather than perfectly structured responses.
+# """
+
+# # Initialize LLM with natural speech instructions
+# llm = OpenAILLM.with_azure(
+#     azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+#     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+#     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+#     api_version=os.getenv("OPENAI_API_VERSION"),
 # )
-# from livekit import api
 
-# # ── plugin imports (current API) ───────────────────────────────
-# from livekit.plugins.azure  import STT, TTS          # Azure Speech
-# from livekit.plugins.silero import VAD              # Silero VAD
-# from livekit.plugins.turn_detector.english import EnglishModel
-# from livekit.plugins.openai import LLM              # OpenAI/Azure OpenAI
-# # ───────────────────────────────────────────────────────────────
-
-# # Load .env / .env.local
-# if os.path.exists(".env.local"):
-#     load_dotenv(".env.local")
-# else:
-#     load_dotenv()
-
-# # Required env vars --------------------------------------------
-# LIVEKIT_URL        = os.getenv("LIVEKIT_URL")          # wss://…livekit.cloud
-# LIVEKIT_API_KEY    = os.getenv("LIVEKIT_API_KEY")
-# LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
-# SIP_TRUNK_ID       = os.getenv("SIP_OUTBOUND_TRUNK_ID")
-
-# TEST_PHONE_NUMBER  = "+447388449042"   # 🔁 replace with your phone
-# # --------------------------------------------------------------
-
-# logging.basicConfig(level=logging.INFO)
-# log = logging.getLogger("outbound-test")
-
-# # ───────────────────────────────────────────────────────────────
-# class OutboundBot(Agent):
-#     """Minimal agent that lets AgentSession+LLM handle replies."""
-#     async def on_message(self, ctx, message):
-#         await ctx.session.generate_reply()
+# async def generate_natural_response(text: str):
+#     """Generate a natural-sounding response with conversational fillers"""
+#     # Simulate thinking time
+#     await asyncio.sleep(random.uniform(1.0, 3.0))
+    
+#     # Get LLM response with natural speech patterns
+#     response = await llm.chat(
+#         messages=[
+#             {"role": "system", "content": NATURAL_SPEECH_INSTRUCTIONS},
+#             {"role": "user", "content": text}
+#         ],
+#         max_tokens=200,
+#     )
+    
+#     return response
 
 # async def entrypoint(ctx: JobContext):
-#     """Worker entry: create call, start session, simple dialogue."""
-#     await ctx.connect()
+#     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-#     # ---------- voice / LLM pipeline ---------------------------
-#     llm = LLM.with_azure(
-#         model="gpt-4o-mini",
-#         azure_endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT"),
-#         azure_deployment = "gpt-4o-mini",
-#         api_version      = os.getenv("OPENAI_API_VERSION"),
-#         api_key          = os.getenv("AZURE_OPENAI_API_KEY"),
-#         #tool_choice      = "auto",
+#     meta = json.loads(ctx.job.metadata or "{}")
+#     phone = meta.get('phone_number')
+#     topic = meta.get('context', 'this call')
+
+#     # Initialize plugins
+#     stt = AzureSTT(
+#         speech_key=os.getenv('AZURE_SPEECH_KEY'),
+#         speech_region=os.getenv('AZURE_SPEECH_REGION'),
 #     )
-#     stt = STT(   # keys can also come purely from env vars
-#         speech_key   = os.getenv("AZURE_SPEECH_KEY"),
-#         speech_region= os.getenv("AZURE_SPEECH_REGION")
+#     tts = AzureTTS(
+#         speech_key=os.getenv('AZURE_SPEECH_KEY'),
+#         speech_region=os.getenv('AZURE_SPEECH_REGION'),
+#         voice="en-US-JennyNeural"
 #     )
-#     tts = TTS(
-#         speech_key   = os.getenv("AZURE_SPEECH_KEY"),
-#         speech_region= os.getenv("AZURE_SPEECH_REGION"),
-#         voice        = "en-US-JennyNeural",
-#     )
+    
+#     # Initialize VAD
+#     vad = SileroVAD.load()
+
+#     opening_line = "Hi, this is Heka speaking. How can I assist you today?"
+#     fallback_line = "Are you still there? Let me know if I can help with anything."
+
+#     if phone:
+#         await ctx.api.sip.create_sip_participant(
+#             CreateSIPParticipantRequest(
+#                 room_name=ctx.room.name,
+#                 sip_trunk_id=os.getenv('SIP_OUTBOUND_TRUNK_ID'),
+#                 sip_call_to=phone,
+#                 participant_identity=phone,
+#                 wait_until_answered=True,
+#             )
+#         )
+#         print(f"📞 Calling {phone} about '{topic}'... connected")
+
+#     # Create agent session
 #     session = AgentSession(
-#         #turn_detector = EnglishModel(),
-#         turn_detection = EnglishModel(),
-#         vad           = VAD.load(),      # download model on first run
-#         stt           = stt,
-#         llm           = llm,
-#         tts           = tts,
+#         stt=stt,
+#         llm=llm,
+#         tts=tts,
+#         vad=vad,
 #     )
-#     bot = OutboundBot(instructions="You are a friendly outbound calling agent. Greet the user, ask the user's name and then ask them if they would like to be contacted by a human agent.")
 
-#     # ---------- place outbound SIP call ------------------------
-#     await ctx.api.sip.create_sip_participant(
-#         api.CreateSIPParticipantRequest(
-#             room_name            = ctx.room.name,
-#             sip_trunk_id         = SIP_TRUNK_ID,
-#             sip_call_to          = TEST_PHONE_NUMBER,
-#             participant_identity = TEST_PHONE_NUMBER,
-#             wait_until_answered  = True,
-#         )
-#     )
-#     log.info("Dialling %s via trunk %s", TEST_PHONE_NUMBER, SIP_TRUNK_ID)
-
-#     # ---------- run the interactive session --------------------
+#     # Start session
 #     await session.start(
-#         agent = bot,
-#         room  = ctx.room,
-#         room_input_options = RoomInputOptions()  # default noise-suppr.
+#         room=ctx.room,
+#         agent=Agent(instructions=NATURAL_SPEECH_INSTRUCTIONS),
 #     )
 
-#     await session.say(
-#         "Hello! This is an automated test call from Heka Agent. "
-#         "Can I ask you a quick question?"
-#     )
+#     # Initial greeting
+#     await session.say(opening_line)
 
-#     # reply = await session.listen()
-#     # log.info("User said: %r", reply.transcript)
+#     # Main conversation loop
+#     last_activity = time.time()
+#     while True:
+#         try:
+#             # Wait for transcript event using documented approach
+#             # Create a future to wait for the next transcript
+#             transcript_future = asyncio.Future()
+            
+#             def on_transcript(event):
+#                 if not transcript_future.done():
+#                     transcript_future.set_result(event)
+            
+#             session.on("transcript_received", on_transcript)
+            
+#             try:
+#                 # Wait for either transcript or timeout
+#                 event = await asyncio.wait_for(transcript_future, timeout=10)
+#                 last_activity = time.time()
+                
+#                 # Generate natural response with fillers
+#                 response = await generate_natural_response(event.transcript)
+#                 print(f"🗣️ Response: {response}")
+#                 await session.say(response)
+                
+#             except asyncio.TimeoutError:
+#                 # Remove the event listener if no transcript was received
+#                 session.off("transcript_received", on_transcript)
+                
+#                 # Check for inactivity
+#                 if time.time() - last_activity > 15:
+#                     await session.say(fallback_line)
+#                     last_activity = time.time()
+            
+#         except Exception as e:
+#             print(f"Error: {e}")
+#             break
 
-#     # if "yes" in reply.transcript.lower():
-#     #     await session.say("Great, thanks for confirming. Have a wonderful day!")
-#     # else:
-#     #     await session.say("No worries. Goodbye!")
-#     async def on_message(self, ctx, message):
-#         await ctx.session.generate_reply()
+#     # Properly end the session
+#     await session.end()
 
-
-#     await session.end()   # hangs up + closes room
-# # ───────────────────────────────────────────────────────────────
-
-# if __name__ == "__main__":
-#     cli.run_app(
+# if __name__ == '__main__':
+#     if len(sys.argv) == 1:
+#         sys.argv.append('dev')
+#     run_app(
 #         WorkerOptions(
-#             entrypoint_fnc = entrypoint,
-#             agent_name     = "outbound-test-caller",
+#             entrypoint_fnc=entrypoint,
+#             agent_name='heka-telephony-agent'
 #         )
 #     )
-
 import os
 import json
-import logging
+import sys
 import asyncio
+import random
+import time
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentSession, JobContext, cli, WorkerOptions
-from livekit import api
-from livekit.plugins.azure import STT, TTS
-from livekit.plugins.silero import VAD
-from livekit.plugins.turn_detector.english import EnglishModel
-from livekit.plugins.openai import LLM
 
-if os.path.exists(".env.local"):
-    load_dotenv(".env.local")
-else:
-    load_dotenv()
+from livekit.agents.cli import run_app
+from livekit.agents import JobContext, WorkerOptions, AutoSubscribe
+from livekit.agents.voice import AgentSession, Agent
+from livekit.api.sip_service import CreateSIPParticipantRequest
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
-SIP_TRUNK_ID = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+from livekit.plugins.azure.stt import STT as AzureSTT
+from livekit.plugins.openai import LLM as OpenAILLM
+from livekit.plugins.silero.vad import VAD as SileroVAD
+from livekit.plugins import elevenlabs
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("outbound-agent")
+# Load environment variables
+dotenv_path = os.getenv("DOTENV_PATH")
+load_dotenv(dotenv_path if dotenv_path else None)
 
-class OutboundBot(Agent):
-    async def on_message(self, ctx, message):
-        await ctx.session.generate_reply()
+# Enhanced instructions for natural speech
+NATURAL_SPEECH_INSTRUCTIONS = """
+You are a friendly, helpful assistant named Heka. Speak naturally with occasional conversational fillers like 
+"um", "uh", "you know", "like", "actually", and "I mean" to sound more human. Use short pauses between thoughts 
+represented by commas and periods. Keep responses concise but add natural variations in pacing.
+
+Examples of natural responses:
+- "Hmm, let me think about that for a moment..."
+- "Okay, so what you're asking is... uh... about the weather?"
+- "Well, actually, I believe the forecast says..."
+- "You know, I think we should consider..."
+- "Right, so to answer your question..."
+
+Focus on creating natural, flowing conversation rather than perfectly structured responses.
+"""
+
+# Initialize LLM with natural speech instructions
+llm = OpenAILLM.with_azure(
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("OPENAI_API_VERSION"),
+)
+
+async def generate_natural_response(text: str):
+    """Generate a natural-sounding response with conversational fillers"""
+    # Simulate thinking time
+    await asyncio.sleep(random.uniform(1.0, 3.0))
+    
+    # Get LLM response with natural speech patterns
+    response = await llm.chat(
+        messages=[
+            {"role": "system", "content": NATURAL_SPEECH_INSTRUCTIONS},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=200,
+    )
+    
+    return response
 
 async def entrypoint(ctx: JobContext):
-    await ctx.connect()
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Setup voice + LLM pipeline
-    llm = LLM.with_azure(
-        model="gpt-4o-mini",
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        azure_deployment="gpt-4o-mini",
-        api_version=os.getenv("OPENAI_API_VERSION"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY")
-    )
-    stt = STT(speech_key=os.getenv("AZURE_SPEECH_KEY"),
-              speech_region=os.getenv("AZURE_SPEECH_REGION"))
-    tts = TTS(speech_key=os.getenv("AZURE_SPEECH_KEY"),
-              speech_region=os.getenv("AZURE_SPEECH_REGION"),
-              voice="en-US-JennyNeural")
-    session = AgentSession(
-        turn_detection=EnglishModel(),
-        vad=VAD.load(),
-        stt=stt,
-        llm=llm,
-        tts=tts
-    )
-    bot = OutboundBot(instructions=(
-        "You are a friendly outbound calling agent. "
-        "Greet the user, ask their name, and ask if they want to speak to a human."
-    ))
+    meta = json.loads(ctx.job.metadata or "{}")
+    phone = meta.get('phone_number')
+    topic = meta.get('context', 'this call')
 
-    data = ctx.job.metadata or "{}"
-    info = json.loads(data)
-    phone = info.get("phone_number")
-    topic = info.get("topic", "a quick call")
+    # Initialize STT
+    stt = AzureSTT(
+        speech_key=os.getenv('AZURE_SPEECH_KEY'),
+        speech_region=os.getenv('AZURE_SPEECH_REGION'),
+    )
+
+    # Initialize ElevenLabs TTS (inspired by your previous integration)
+    tts = elevenlabs.TTS(
+        api_key=os.getenv("ELEVEN_API_KEY"),
+        voice_id="EXAVITQu4vr4xnSDxMaL",  # Default known working voice
+        #voice_id="pBZVCk298iJlHAcHQwLr",
+        model="eleven_multilingual_v2",
+        streaming_latency=1,
+        #streaming_latency=int(os.getenv("ELEVEN_STREAMING_LATENCY", "1")),
+    )
+    
+    # Initialize VAD
+    vad = SileroVAD.load()
+
+    opening_line = "Hi, this is Heka speaking. How can I assist you today?"
+    fallback_line = "Are you still there? Let me know if I can help with anything."
 
     if phone:
         await ctx.api.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
+            CreateSIPParticipantRequest(
                 room_name=ctx.room.name,
-                sip_trunk_id=SIP_TRUNK_ID,
+                sip_trunk_id=os.getenv('SIP_OUTBOUND_TRUNK_ID'),
                 sip_call_to=phone,
                 participant_identity=phone,
-                wait_until_answered=True
+                wait_until_answered=True,
             )
         )
-        log.info("Dialing %s via trunk %s", phone, SIP_TRUNK_ID)
+        print(f"📞 Calling {phone} about '{topic}'... connected")
 
-    await session.start(agent=bot, room=ctx.room,
-                        room_input_options=None)
-
-    await session.say(
-        f"Hello! This is an automated call regarding {topic}. May I ask you a quick question?"
+    # Create agent session
+    session = AgentSession(
+        stt=stt,
+        llm=llm,
+        tts=tts,
+        vad=vad,
     )
 
-    reply = await session.listen()
-    log.info("User replied: %r", reply.transcript)
+    # Start session
+    await session.start(
+        room=ctx.room,
+        agent=Agent(instructions=NATURAL_SPEECH_INSTRUCTIONS),
+    )
 
-    if reply.transcript and "yes" in reply.transcript.lower():
-        await session.say("Fantastic! Thank you for your time. Goodbye!")
-    else:
-        await session.say("Alright, maybe another time. Goodbye!")
+    # Initial greeting
+    await session.say(opening_line)
+
+    # Main conversation loop
+    last_activity = time.time()
+    while True:
+        try:
+            transcript_future = asyncio.Future()
+            def on_transcript(event):
+                if not transcript_future.done():
+                    transcript_future.set_result(event)
+            session.on("transcript_received", on_transcript)
+            
+            try:
+                event = await asyncio.wait_for(transcript_future, timeout=10)
+                last_activity = time.time()
+                
+                response = await generate_natural_response(event.transcript)
+                print(f"🗣️ Response: {response}")
+                await session.say(response)
+                
+            except asyncio.TimeoutError:
+                session.off("transcript_received", on_transcript)
+                if time.time() - last_activity > 15:
+                    await session.say(fallback_line)
+                    last_activity = time.time()
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            break
 
     await session.end()
 
-if __name__ == "__main__":
-    opts = WorkerOptions(
-        entrypoint_fnc=entrypoint,
-        agent_name="outbound-telephony-agent"
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        sys.argv.append('dev')
+    run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name='heka-telephony-agent'
+        )
     )
-    cli.run_app(opts)
