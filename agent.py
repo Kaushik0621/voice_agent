@@ -176,13 +176,17 @@ from livekit.agents.voice import AgentSession, Agent
 from livekit.api.sip_service import CreateSIPParticipantRequest
 
 from livekit.plugins.azure.stt import STT as AzureSTT
+from livekit.plugins.azure.tts import TTS as AzureTTS
 from livekit.plugins.openai import LLM as OpenAILLM
 from livekit.plugins.silero.vad import VAD as SileroVAD
 from livekit.plugins import elevenlabs
 
+
 # Load environment variables
 dotenv_path = os.getenv("DOTENV_PATH")
 load_dotenv(dotenv_path if dotenv_path else None)
+
+
 
 # Enhanced instructions for natural speech
 NATURAL_SPEECH_INSTRUCTIONS = """
@@ -238,6 +242,16 @@ async def entrypoint(ctx: JobContext):
     )
 
     # Initialize ElevenLabs TTS (inspired by your previous integration)
+    # tts = CustomAzureTTS(
+    #     speech_key=os.getenv("AZURE_SPEECH_KEY"),
+    #     speech_region=os.getenv("AZURE_SPEECH_REGION"),
+    #     voice="en-US-AriaNeural"
+    #     )
+    # tts = AzureTTS(
+    #     speech_key=os.getenv('AZURE_SPEECH_KEY'),
+    #     speech_region=os.getenv('AZURE_SPEECH_REGION'),
+    #     voice="en-US-JennyNeural"
+    # )
     tts = elevenlabs.TTS(
         api_key=os.getenv("ELEVEN_API_KEY"),
         voice_id="EXAVITQu4vr4xnSDxMaL",  # Default known working voice
@@ -250,7 +264,7 @@ async def entrypoint(ctx: JobContext):
     # Initialize VAD
     vad = SileroVAD.load()
 
-    opening_line = "Hi, this is Heka speaking. How can I assist you today?"
+    opening_line = "Hi, this is your assistant speaking. you wanted me to call you. How can I assist you today?"
     fallback_line = "Are you still there? Let me know if I can help with anything."
 
     if phone:
@@ -302,7 +316,7 @@ async def entrypoint(ctx: JobContext):
                 
             except asyncio.TimeoutError:
                 session.off("transcript_received", on_transcript)
-                if time.time() - last_activity > 15:
+                if time.time() - last_activity > 25:
                     await session.say(fallback_line)
                     last_activity = time.time()
             
